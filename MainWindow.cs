@@ -1,5 +1,5 @@
 //#define UpdateChangelog
-//#define CleanFilesNotInMd5List
+#define CleanFilesNotInMd5List
 //#define EnableServerList
 //#define ENABLE_LOGGING
 
