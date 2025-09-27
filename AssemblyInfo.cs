@@ -22,8 +22,8 @@ using System.Windows.Resources;
 [assembly: AssemblyFileVersion("0.9.0.0")]
 [assembly: AssemblyVersion("0.9.0.0")]
 #else
-[assembly: AssemblyFileVersion("1.0.0.0")]
-[assembly: AssemblyVersion("1.0.0.0")]
+[assembly: AssemblyFileVersion("1.0.0.1")]
+[assembly: AssemblyVersion("1.0.0.1")]
 #endif
 
 [assembly: AssemblyAssociatedContentFile("webview2loader.dll")]

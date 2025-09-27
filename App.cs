@@ -3,7 +3,7 @@ using System.CodeDom.Compiler;
 using System.Diagnostics;
 using System.Windows;
 
-namespace C2COMMUNITY_Mod_Launcher
+namespace Crysis3_MP_Launcher
 {
 	public class App : Application
 	{

@@ -3,7 +3,7 @@ using System.IO;
 using System.Collections.Generic;
 using System.Linq;
 
-namespace C2COMMUNITY_Mod_Launcher
+namespace Crysis3_MP_Launcher
 {
     public class LauncherDataManager
     {

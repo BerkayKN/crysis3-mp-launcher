@@ -1,3 +1,4 @@
+#define ENABLE_LOGGING
 using System;
 using System.Diagnostics;
 using System.IO;
@@ -6,12 +7,26 @@ using System.Reflection;
 using System.Threading.Tasks;
 using System.Windows;
 
-namespace C2COMMUNITY_Mod_Launcher
+namespace Crysis3_MP_Launcher
 {
     public class VersionChecker
     {
-        private const string VERSION_CHECK_URL = MainWindow.DEFAULT_SERVER_URL + "/C3MP/Launcher/index.php";
-        private const string UPDATE_SITE_URL = "http://lb.crysis2.epicgamer.org/C3MP/Launcher/Crysis%203%20Multiplayer%20Launcher.exe";
+        // Remove static consts for URLs
+        //private const string VERSION_CHECK_URL = MainWindow.DEFAULT_SERVER_URL + "/C3MP/Launcher/index.php";
+        //private const string UPDATE_SITE_URL = "http://lb.crysis2.epicgamer.org/C3MP/Launcher/Crysis%203%20Multiplayer%20Launcher.exe";
+
+        // Add a method to get the current server base URL from MainWindow
+        private static string GetServerBaseUrl()
+        {
+            // Try to get the current MainWindow instance and its _serverBaseUrl
+            if (Application.Current?.MainWindow is MainWindow mw && !string.IsNullOrWhiteSpace(mw.ServerBaseUrl))
+                return mw.ServerBaseUrl;
+            // Fallback to default
+            return MainWindow.DEFAULT_SERVER_URL;
+        }
+
+        private static string GetVersionCheckUrl() => GetServerBaseUrl() + "/C3MP/Launcher/index.php";
+        private static string GetUpdateSiteUrl() => GetServerBaseUrl() + "/C3MP/Launcher/Crysis%203%20Multiplayer%20Launcher.exe";
 
         public static async Task CheckForUpdates()
         {
@@ -93,7 +108,7 @@ namespace C2COMMUNITY_Mod_Launcher
             {
                 using (var client = new HttpClient())
                 {
-                    string response = await client.GetStringAsync(VERSION_CHECK_URL);
+                    string response = await client.GetStringAsync(GetVersionCheckUrl());
                     return ParseVersionInfo(response);
                 }
             }
@@ -191,9 +206,10 @@ namespace C2COMMUNITY_Mod_Launcher
 
         private static void OpenUpdateSite()
         {
+            string updateUrl = GetUpdateSiteUrl();
             try
             {
-                Process.Start(UPDATE_SITE_URL);
+                Process.Start(updateUrl);
             }
             catch
             {
@@ -202,14 +218,14 @@ namespace C2COMMUNITY_Mod_Launcher
                 {
                     ProcessStartInfo psi = new ProcessStartInfo
                     {
-                        FileName = UPDATE_SITE_URL,
+                        FileName = updateUrl,
                         UseShellExecute = true
                     };
                     Process.Start(psi);
                 }
                 catch (Exception ex)
                 {
-                    MessageBox.Show($"Failed to open update page: {ex.Message}\nPlease visit {UPDATE_SITE_URL} manually.",
+                    MessageBox.Show($"Failed to open update page: {ex.Message}\nPlease visit {updateUrl} manually.",
                         "Error", MessageBoxButton.OK, MessageBoxImage.Error);
                 }
             }

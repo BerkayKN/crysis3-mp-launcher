@@ -9,6 +9,7 @@
     <AppendTargetFrameworkToOutputPath>false</AppendTargetFrameworkToOutputPath>
     <VersionPrefix>1.0.0</VersionPrefix>
     <VersionSuffix>0</VersionSuffix>
+    <Configurations>Debug;Release;Release - Copy to Game Folder</Configurations>
   </PropertyGroup>
   
   <PropertyGroup Condition="'$(Platform)|$(Configuration)'=='x86|Debug'">
@@ -40,14 +41,22 @@
     <AllowUnsafeBlocks>True</AllowUnsafeBlocks>
   </PropertyGroup>
   <PropertyGroup>
-    <ApplicationIcon>Launcher.ico</ApplicationIcon>
+    <ApplicationIcon>resources\Launcher.ico</ApplicationIcon>
     <RootNamespace />
     <Win32Resource />
     <StartupObject />
+    <PlatformTarget>AnyCPU</PlatformTarget>
+  </PropertyGroup>
+  <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Release - Copy to Game Folder|x86'">
+    <Optimize>True</Optimize>
+  </PropertyGroup>
+  <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Release - Copy to Game Folder|x64'">
+    <Optimize>True</Optimize>
   </PropertyGroup>
   <ItemGroup>
     <None Remove="fodyweavers.xml" />
     <None Remove="resources\background.jpg" />
+    <Content Include="resources\Launcher.ico" />
     <EmbeddedResource Include="fodyweavers.xml" LogicalName="fodyweavers.xml" />
   </ItemGroup>
   <ItemGroup>

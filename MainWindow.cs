@@ -1,4 +1,3 @@
-//#define DirectoryStructureCheck
 //#define UpdateChangelog
 //#define CleanFilesNotInMd5List
 //#define EnableServerList
@@ -24,16 +23,16 @@ using Newtonsoft.Json;
 using Newtonsoft.Json.Linq;
 using System.Security.Principal;
 using System.Windows.Controls;
+using System.Windows.Media.Imaging;
 
-
-namespace C2COMMUNITY_Mod_Launcher
+namespace Crysis3_MP_Launcher
 {
     public partial class MainWindow : Window, IComponentConnector
     {
         //Start of Defines
         private const string MD5_FILE_PATH = "/C3MP/ModFiles/md5sum.php";
         private const string WEBVIEW_DLL_PATH = "/openspymod/WebView2Loader.dll";
-        public const string DEFAULT_SERVER_URL = "http://lb.crysis2.epicgamer.org";
+        public const string DEFAULT_SERVER_URL = "http://lb.crysis2.privatedns.org";
         private const string GAME_MOD_FOLDER = "C3MP";
         private const string SERVER_MOD_PATH = "/C3MP/ModFiles/";
         private const string SERVER_LIST_SOURCE_URL = "https://openspy-website.nyc3.digitaloceanspaces.com/servers/capricorn.json";
@@ -42,6 +41,7 @@ namespace C2COMMUNITY_Mod_Launcher
         //End of Defines
 
         private string _serverBaseUrl;
+        public string ServerBaseUrl => _serverBaseUrl;
         private readonly string _bin32Folder;
         private readonly string _gameFolder;
         private string _md5Url;
@@ -54,7 +54,7 @@ namespace C2COMMUNITY_Mod_Launcher
         private string _jsonVersion;
         private readonly DispatcherTimer _serverTimer;
         //internal WebView2 webView;
-        public ObservableCollection<Server> Servers { get; }
+        public ObservableCollection<Serverlist> Servers { get; }
 
         private List<string> _failedDownloads = new List<string>();
 
@@ -73,6 +73,8 @@ namespace C2COMMUNITY_Mod_Launcher
 
         private int _downloadedFileCount;
 
+        public string BackgroundImageUrl => ($"{_serverBaseUrl}/C3MP/background.png");
+
         public MainWindow()
         {
             #if ENABLE_LOGGING
@@ -88,6 +90,7 @@ namespace C2COMMUNITY_Mod_Launcher
             #endif
 
             InitializeComponent();
+            DataContext = this;
             _bin32Folder = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "bin32");
             _gameFolder = AppDomain.CurrentDomain.BaseDirectory;
             _webView2LoaderPath = Path.Combine(_gameFolder, "WebView2Loader.dll");
@@ -97,7 +100,7 @@ namespace C2COMMUNITY_Mod_Launcher
             LogMessage($"[INIT] Administrator: {_isAdministrator}");
 
             UpdateWindowTitle();
-            Servers = new ObservableCollection<Server>();
+            Servers = new ObservableCollection<Serverlist>();
             serverListView.ItemsSource = Servers;
             
             #if EnableServerList
@@ -140,7 +143,6 @@ namespace C2COMMUNITY_Mod_Launcher
                 _serverBaseUrl = DEFAULT_SERVER_URL;
             }
             _md5Url = $"{_serverBaseUrl}" + MD5_FILE_PATH;
-            //_zipUrl = $"{_serverBaseUrl}{ZIP_FILE_PATH}";
             _WebViewDLLUrl = $"{_serverBaseUrl}{WEBVIEW_DLL_PATH}";
         }
 
@@ -195,16 +197,15 @@ namespace C2COMMUNITY_Mod_Launcher
                 return;
             }
 
-            // First check for launcher updates and wait for it to complete
+            // First initialize server base URL
+            await InitializeAsync();
+            // Then check for launcher updates
             await VersionChecker.CheckForUpdates();
-            
             // After launcher update check is complete, then proceed with mod files check
             await UpdateStatusLabelAsync("Checking mod files...");
-            await InitializeAsync();
-            
+			_ = SetBackgroundImageAsync();
             var progress = new Progress<string>(message => statusLabel.Content = message);
             await Task.Run(() => CheckAndUpdateModFiles(progress));
-            
             launchGameButton.IsEnabled = true;
         }
 
@@ -232,18 +233,6 @@ namespace C2COMMUNITY_Mod_Launcher
                    
                     // MD5 checks for total file count
                     int totalFiles = fileHashes.Count;
-                    int checkedFiles = 0;
-
-                    #if DirectoryStructureCheck
-                    await UpdateStatusLabelAsync("Checking file paths...");
-                    pathsCorrected = await CheckDirectoryCasings(fileHashes, progress);
-
-                    if (pathsCorrected)
-                    {
-                        await UpdateStatusLabelAsync("File paths were corrected, rechecking...");
-                        continue;
-                    }
-                    #endif
 
                     dynamic val = JsonConvert.DeserializeObject<object>(md5Data);
                     
@@ -318,7 +307,7 @@ namespace C2COMMUNITY_Mod_Launcher
 
                     #if CleanFilesNotInMd5List
                     progress.Report("Cleaning up old files...");
-                    DeleteFilesNotInMd5List(fileHashes, progress);
+                    await DeleteFilesNotInMd5List(fileHashes, progress);
                     #endif
 
                     await Dispatcher.InvokeAsync(() =>
@@ -326,9 +315,9 @@ namespace C2COMMUNITY_Mod_Launcher
                         UpdateProgressBar(0, 0, 0, 0, string.Empty);
                         HideDownloadLabels();
                         UpdateVersionLabel();
-#if UpdateChangelog
+                    #if UpdateChangelog
                         ChangelogTab.IsEnabled = true;
-#endif
+                    #endif
                     });
                     
                     progress.Report("Ready to play");
@@ -399,70 +388,70 @@ namespace C2COMMUNITY_Mod_Launcher
             netSpeedLabel.Content = string.Empty;
             progressLabel.Content = string.Empty;
         });
-        
+		
 
-        private void DeleteFilesNotInMd5List(Dictionary<string, string> fileHashes, IProgress<string> progress)
+        private string NormalizePath(string path)
         {
-            string modSpyModFolder = Path.Combine(_gameFolder, "Mods", GAME_MOD_FOLDER);
-            
-            // First check and delete files
-            foreach (string filePath in Directory.EnumerateFiles(modSpyModFolder, "*", SearchOption.AllDirectories))
-            {
-                string relativePath = filePath.Replace(modSpyModFolder, "")
-                    .TrimStart(Path.DirectorySeparatorChar)
-                    .Replace('\\', '/');
-                    
-                string url = Uri.UnescapeDataString($"{_serverBaseUrl}{SERVER_MOD_PATH}Mods/{GAME_MOD_FOLDER}/{Uri.EscapeDataString(relativePath)}");
-                
-                if (!fileHashes.ContainsKey(url))
-                {
-                    try
-                    {
-                        progress.Report($"Deleting file: {Path.GetFileName(filePath)}...");
-                        LogMessage($"[DELETE] {filePath} - File deleted because it was not found in server's MD5 list (old/unnecessary file)");
-                        File.Delete(filePath);
-                    }
-                    catch (Exception ex)
-                    {
-                        MessageBox.Show($"Error deleting file {filePath}: {ex.Message}", "Error", MessageBoxButton.OK, MessageBoxImage.Error);
-                    }
-                }
-            }
-
-            // Then check and delete directories not in MD5 list
-            foreach (string dirPath in Directory.EnumerateDirectories(modSpyModFolder, "*", SearchOption.AllDirectories).OrderByDescending(x => x.Length))
-            {
-                string relativePath = dirPath.Replace(modSpyModFolder, "")
-                    .TrimStart(Path.DirectorySeparatorChar)
-                    .Replace('\\', '/');
-
-                string url = Uri.UnescapeDataString($"{_serverBaseUrl}{SERVER_MOD_PATH}Mods/{GAME_MOD_FOLDER}/{Uri.EscapeDataString(relativePath)}");
-
-                bool hasMatchingFiles = false;
-                foreach (var hash in fileHashes)
-                {
-                    if (hash.Key.StartsWith(url))
-                    {
-                        hasMatchingFiles = true;
-                        break;
-                    }
-                }
-
-                if (!hasMatchingFiles)
-                {
-                    try
-                    {
-                        progress.Report($"Deleting directory: {Path.GetFileName(dirPath)}...");
-                        LogMessage($"[DELETE] {dirPath} - Directory deleted because it was not found in server's MD5 list");
-                        Directory.Delete(dirPath, true);
-                    }
-                    catch (Exception ex)
-                    {
-                        MessageBox.Show($"Error deleting directory {dirPath}: {ex.Message}", "Error", MessageBoxButton.OK, MessageBoxImage.Error);
-                    }
-                }
-            }
+            return Path.GetFullPath(path).TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar).ToLowerInvariant();
         }
+
+        private async Task DeleteFilesNotInMd5List(Dictionary<string, string> fileHashes, IProgress<string> progress)
+        {
+            await UpdateStatusLabelAsync("Cleaning up old files...");
+
+            string modFolder = Path.Combine(_gameFolder, "Mods", GAME_MOD_FOLDER);
+            if (!Directory.Exists(modFolder)) return;
+
+            // Normalize validFiles when creating
+            var validFiles = new HashSet<string>(
+                fileHashes.Select(fh =>
+                    NormalizePath(Path.Combine(_gameFolder, fh.Key.Replace($"{_serverBaseUrl}{SERVER_MOD_PATH}", "").Replace('/', Path.DirectorySeparatorChar)))
+                ),
+                StringComparer.OrdinalIgnoreCase
+            );
+
+            await Task.Run(() =>
+            {
+                // Delete files
+                var allFiles = Directory.GetFiles(modFolder, "*", SearchOption.AllDirectories);
+                foreach (var filePath in allFiles)
+                {
+                    if (!validFiles.Contains(NormalizePath(filePath)))
+                    {
+                        try { File.Delete(filePath); } catch { }
+                    }
+                }
+
+                // Delete directories (similarly, path can be normalized, but usually not necessary here)
+                var allDirs = Directory.GetDirectories(modFolder, "*", SearchOption.AllDirectories)
+                    .OrderByDescending(x => x.Length);
+                foreach (var dirPath in allDirs)
+                {
+                    string relativePath = dirPath.Replace(modFolder, "")
+                        .TrimStart(Path.DirectorySeparatorChar)
+                        .Replace('\\', '/');
+
+                    string url = Uri.UnescapeDataString($"{_serverBaseUrl}{SERVER_MOD_PATH}Mods/{GAME_MOD_FOLDER}/{Uri.EscapeDataString(relativePath)}");
+
+                    bool hasMatchingFiles = fileHashes.Keys.Any(key => key.StartsWith(url));
+                    if (!hasMatchingFiles)
+                    {
+                        try
+                        {
+                            progress.Report($"Deleting directory: {Path.GetFileName(dirPath)}...");
+                            LogMessage($"[DELETE] {dirPath} - Directory deleted because it was not found in server's MD5 list");
+                            Directory.Delete(dirPath, true);
+                        }
+                        catch (Exception ex)
+                        {
+                            LogMessage($"[ERROR] Error deleting directory {dirPath}: {ex.Message}");
+                            MessageBox.Show($"Error deleting directory {dirPath}: {ex.Message}", "Error", MessageBoxButton.OK, MessageBoxImage.Error);
+                        }
+                    }
+                }
+            });
+        }
+
 
         private async Task<string> DownloadStringAsync(string url)
         {
@@ -902,7 +891,7 @@ namespace C2COMMUNITY_Mod_Launcher
             {
                 using var client = new HttpClient();
                 string json = await client.GetStringAsync(SERVER_LIST_SOURCE_URL);
-                var serverList = JsonConvert.DeserializeObject<List<Server>>(json);
+                var serverList = JsonConvert.DeserializeObject<List<Serverlist>>(json);
                 Dispatcher.Invoke(() =>
                 {
                     Servers.Clear();
@@ -912,188 +901,12 @@ namespace C2COMMUNITY_Mod_Launcher
                     }
                 });
             }
-            catch { /* Ignore errors */ }
-        }
-
-
-
-     
-       private async Task<bool> CheckDirectoryCasings(Dictionary<string, string> fileHashes, IProgress<string> progress)
-        {
-            try
+           catch (Exception ex)
             {
-                var uniqueDirs = new HashSet<string>();
-                
-                // First collect all unique folder paths
-                foreach (var fileHash in fileHashes)
-                {
-                    string relativePath = fileHash.Key.Replace($"{_serverBaseUrl}{SERVER_MOD_PATH}", "").Replace('/', '\\');
-                    string filePath = Path.Combine(_gameFolder, relativePath);
-                    string dirPath = Path.GetDirectoryName(filePath);
-                    if (!string.IsNullOrEmpty(dirPath))
-                    {
-                        uniqueDirs.Add(dirPath);
-                    }
-                }
-
-                var dirList = uniqueDirs.ToList();
-                var maxThreads = Environment.ProcessorCount;
-                var batchSize = Math.Max(1, dirList.Count / maxThreads);
-                var tasks = new List<Task<bool>>();
-                var semaphore = new SemaphoreSlim(maxThreads);
-
-                //progress.Report($"Checking directory casings with {maxThreads} threads...");
-                progress.Report($"Checking directory casings...");
-
-                for (int i = 0; i < dirList.Count; i += batchSize)
-                {
-                    var batch = dirList.Skip(i).Take(batchSize).ToList();
-                    await semaphore.WaitAsync();
-
-                    tasks.Add(Task.Run(async () =>
-                    {
-                        try
-                        {
-                            bool anyCorrections = false;
-                            foreach (var dir in batch)
-                            {
-                                // Create server URL for each folder
-                                string relativePath = dir.Substring(_gameFolder.Length)
-                                                       .TrimStart('\\')
-                                                       .Replace('\\', '/');
-                                string serverUrl = $"{_serverBaseUrl}{SERVER_MOD_PATH}{relativePath}";
-
-                                if (await FixPathCasingAsync(dir, serverUrl))
-                                {
-                                    anyCorrections = true;
-                                }
-                            }
-                            return anyCorrections;
-                        }
-                        finally
-                        {
-                            semaphore.Release();
-                        }
-                    }));
-                }
-
-                var results = await Task.WhenAll(tasks);
-                return results.Any(x => x);
-            }
-            catch (Exception ex)
-            {
-                LogMessage($"[ERROR] CheckDirectoryCasings error: {ex.Message}");
-                return false;
+                LogMessage($"[ERROR] Error updating server list: {ex.Message}");
             }
         }
 
-        private async Task<bool> FixPathCasingAsync(string currentPath, string serverUrl)
-        {
-            try
-            {
-                await _pathSemaphore.WaitAsync();
-
-                string[] pathParts = currentPath.Substring(_gameFolder.Length)
-                              .Trim('\\')
-                              .Split('\\');
-                
-                string currentBasePath = _gameFolder;
-                bool anyCorrections = false;
-
-                LogMessage($"[PATH] Checking path: {currentPath}");
-
-                foreach (string part in pathParts)
-                {
-                    if (string.IsNullOrEmpty(part)) continue;
-
-                    LogMessage($"[PATH] Processing part: {part}");
-
-                    var parentDir = new DirectoryInfo(currentBasePath);
-                    if (!parentDir.Exists)
-                    {
-                        // If parent folder doesn't exist, create it
-                        Directory.CreateDirectory(parentDir.FullName);
-                        LogMessage($"[PATH] Created missing parent directory: {parentDir.FullName}");
-                    }
-
-                    var subDir = parentDir.GetDirectories()
-                        .FirstOrDefault(d => d.Name.Equals(part, StringComparison.OrdinalIgnoreCase));
-
-                    if (subDir == null)
-                    {
-                        // If subfolder doesn't exist, create it
-                        Directory.CreateDirectory(Path.Combine(currentBasePath, part));
-                        LogMessage($"[PATH] Created missing directory: {part}");
-                        currentBasePath = Path.Combine(currentBasePath, part);
-                        continue;
-                    }
-
-                    if (!subDir.Name.Equals(part, StringComparison.Ordinal))
-                    {
-                        try
-                        {
-                            string tempPath = Path.Combine(
-                                Path.GetDirectoryName(subDir.FullName),
-                                $"{Path.GetFileName(subDir.FullName)}_temp_{Guid.NewGuid()}"
-                            );
-                            string targetPath = Path.Combine(currentBasePath, part);
-
-                            // If target folder already exists
-                            if (Directory.Exists(targetPath) && !targetPath.Equals(subDir.FullName, StringComparison.OrdinalIgnoreCase))
-                            {
-                                string backupPath = $"{targetPath}_backup_{Guid.NewGuid()}";
-                                Directory.Move(targetPath, backupPath);
-                                LogMessage($"[PATH] Backed up existing directory to: {backupPath}");
-                            }
-
-                            // If temp folder exists
-                            if (Directory.Exists(tempPath))
-                            {
-                                Directory.Delete(tempPath, true);
-                                LogMessage($"[PATH] Removed existing temp directory: {tempPath}");
-                            }
-
-                            LogMessage($"[PATH] Moving directory to temp path: {tempPath}");
-                            Directory.Move(subDir.FullName, tempPath);
-                            
-                            // Ensure target folder's parent exists
-                            Directory.CreateDirectory(Path.GetDirectoryName(targetPath));
-                            
-                            Directory.Move(tempPath, targetPath);
-                            LogMessage($"[PATH] Successfully fixed directory casing: {subDir.FullName} -> {targetPath}");
-                            anyCorrections = true;
-                        }
-                        catch (Exception ex)
-                        {
-                            LogMessage($"[ERROR] Failed to fix directory casing for {subDir.FullName}: {ex.Message}");
-                            // Continue in case of error, try to fix other folders
-                        }
-                    }
-                    else
-                    {
-                        LogMessage($"[PATH] Directory casing is correct: {subDir.FullName}");
-                    }
-
-                    currentBasePath = Path.Combine(currentBasePath, subDir.Name);
-                }
-
-                LogMessage($"[PATH] Finished checking path: {currentPath}. Corrections made: {anyCorrections}");
-                return anyCorrections;
-            }
-            catch (Exception ex)
-            {
-                LogMessage($"[ERROR] FixPathCasing error for {currentPath}: {ex.Message}");
-                return false;
-            }
-            finally
-            {
-                _pathSemaphore.Release();
-            }
-        }
-
-
-
-     
       private void LogMessage(string message)
         {
             #if !ENABLE_LOGGING
@@ -1118,16 +931,30 @@ namespace C2COMMUNITY_Mod_Launcher
                 Debug.WriteLine($"Logging failed: {ex.Message}");
             }
         }
-  
-  
-  
-  
-  
-  
-  
-  
-  
-   
+		private async Task SetBackgroundImageAsync()
+        {
+            string remoteUrl = $"{_serverBaseUrl}/openspymod/background.png";
+            string embeddedPath = "pack://application:,,,/resources/background.jpg";
+
+            try
+            {
+                using (var httpClient = new HttpClient())
+                {
+                    var response = await httpClient.SendAsync(new HttpRequestMessage(HttpMethod.Head, remoteUrl));
+                    if (response.IsSuccessStatusCode)
+                    {
+                        BackgroundImage.Source = new BitmapImage(new Uri(remoteUrl));
+                        return;
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                LogMessage($"[ERROR] Background image check failed: {ex.Message}");
+            }
+            // Fallback: show embedded image
+            BackgroundImage.Source = new BitmapImage(new Uri(embeddedPath));
+        }
     }
 
 
