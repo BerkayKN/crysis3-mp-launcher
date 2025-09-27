@@ -1,4 +1,4 @@
-<Project Sdk="Microsoft.NET.Sdk.WindowsDesktop">
+﻿<Project Sdk="Microsoft.NET.Sdk.WindowsDesktop">
   <PropertyGroup>
     <AssemblyName>Crysis 3 Multiplayer Launcher</AssemblyName>
     <GenerateAssemblyInfo>False</GenerateAssemblyInfo>
@@ -9,7 +9,7 @@
     <AppendTargetFrameworkToOutputPath>false</AppendTargetFrameworkToOutputPath>
     <VersionPrefix>1.0.0</VersionPrefix>
     <VersionSuffix>0</VersionSuffix>
-    <Configurations>Debug;Release;Release - Copy to Game Folder</Configurations>
+    <Configurations>Debug;Release</Configurations>
   </PropertyGroup>
   
   <PropertyGroup Condition="'$(Platform)|$(Configuration)'=='x86|Debug'">
@@ -46,12 +46,6 @@
     <Win32Resource />
     <StartupObject />
     <PlatformTarget>AnyCPU</PlatformTarget>
-  </PropertyGroup>
-  <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Release - Copy to Game Folder|x86'">
-    <Optimize>True</Optimize>
-  </PropertyGroup>
-  <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Release - Copy to Game Folder|x64'">
-    <Optimize>True</Optimize>
   </PropertyGroup>
   <ItemGroup>
     <None Remove="fodyweavers.xml" />
