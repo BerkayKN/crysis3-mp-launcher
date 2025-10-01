@@ -37,7 +37,7 @@ namespace Crysis3_MP_Launcher
         private const string SERVER_MOD_PATH = "/C3MP/ModFiles/";
         private const string SERVER_LIST_SOURCE_URL = "https://openspy-website.nyc3.digitaloceanspaces.com/servers/capricorn.json";
         private const string GAME_STARTER_FILE_NAME = "Crysis 3 - Mod C3MP.bat";
-        private const string GET_SERVER_URL = "https://raw.githubusercontent.com/BerkayKN/crysis2-mp-launcher/main/server/server.txt";
+        private const string GET_SERVER_URL = "https://raw.githubusercontent.com/BerkayKN/crysis3-mp-launcher/main/server/server.txt";
         //End of Defines
 
         private string _serverBaseUrl;
