@@ -8,32 +8,39 @@ namespace Crysis3_MP_Launcher
     public class LauncherDataManager
     {
         private const string DATA_FILE = "launcher.dat";
+        private static readonly object _dataLock = new object();
         private static Dictionary<string, string> _dataCache;
 
         public static string GetValue(string key)
         {
-            if (_dataCache == null)
+            lock (_dataLock)
             {
-                LoadData();
-            }
+                if (_dataCache == null)
+                {
+                    LoadData();
+                }
 
-            if (_dataCache.TryGetValue(key, out string value))
-            {
-                return value;
-            }
+                if (_dataCache.TryGetValue(key, out string value))
+                {
+                    return value;
+                }
 
-            return null;
+                return null;
+            }
         }
 
         public static void SetValue(string key, string value)
         {
-            if (_dataCache == null)
+            lock (_dataLock)
             {
-                LoadData();
-            }
+                if (_dataCache == null)
+                {
+                    LoadData();
+                }
 
-            _dataCache[key] = value;
-            SaveData();
+                _dataCache[key] = value;
+                SaveData();
+            }
         }
 
         private static void LoadData()

@@ -11,17 +11,10 @@ namespace Crysis3_MP_Launcher
 {
     public class VersionChecker
     {
-        // Remove static consts for URLs
-        //private const string VERSION_CHECK_URL = MainWindow.DEFAULT_SERVER_URL + "/C3MP/Launcher/index.php";
-        //private const string UPDATE_SITE_URL = "http://lb.crysis2.epicgamer.org/C3MP/Launcher/Crysis%203%20Multiplayer%20Launcher.exe";
-
-        // Add a method to get the current server base URL from MainWindow
         private static string GetServerBaseUrl()
         {
-            // Try to get the current MainWindow instance and its _serverBaseUrl
             if (Application.Current?.MainWindow is MainWindow mw && !string.IsNullOrWhiteSpace(mw.ServerBaseUrl))
                 return mw.ServerBaseUrl;
-            // Fallback to default
             return MainWindow.DEFAULT_SERVER_URL;
         }
 
@@ -40,13 +33,11 @@ namespace Crysis3_MP_Launcher
                 bool updateAvailable = IsUpdateAvailable(currentVersion, versionInfo.LatestVersion);
                 bool updateRequired = IsUpdateRequired(currentVersion, versionInfo.RequiredVersion);
 
-                // Check if this update was already skipped
                 if (!updateRequired && updateAvailable)
                 {
                     string skippedVersion = GetSkippedVersion();
                     if (skippedVersion == versionInfo.LatestVersion)
                     {
-                        // User already skipped this version, don't prompt again
                         return;
                     }
                 }
@@ -70,24 +61,20 @@ namespace Crysis3_MP_Launcher
                     if (result == MessageBoxResult.Yes)
                     {
                         OpenUpdateSite();
-                        // Update page opened, close launcher
                         Application.Current.Shutdown();
                     }
                     else if (updateRequired)
                     {
-                        // Force close if update is required but user declined
                         Application.Current.Shutdown();
                     }
                     else
                     {
-                        // User declined a non-required update, remember this choice
                         SaveSkippedVersion(versionInfo.LatestVersion);
                     }
                 }
             }
             catch (Exception ex)
             {
-                // Log exception but don't show to user - silently continue if version check fails
                 LogVersionCheckError(ex);
             }
         }
@@ -131,7 +118,6 @@ namespace Crysis3_MP_Launcher
                 string requiredVersion = lines[1].Replace("ReqVer:", "").Trim();
                 string updateInfo = "";
 
-                // Find and collect UpdateInfo section
                 bool foundUpdateInfo = false;
                 for (int i = 2; i < lines.Length; i++)
                 {
@@ -199,7 +185,6 @@ namespace Crysis3_MP_Launcher
             }
             catch
             {
-                // Fall back to string comparison if version parsing fails
                 return string.Compare(version1, version2, StringComparison.Ordinal);
             }
         }
@@ -213,7 +198,6 @@ namespace Crysis3_MP_Launcher
             }
             catch
             {
-                // On newer .NET versions, Process.Start might not work directly with URLs
                 try
                 {
                     ProcessStartInfo psi = new ProcessStartInfo
@@ -233,18 +217,7 @@ namespace Crysis3_MP_Launcher
 
         private static void LogVersionCheckError(Exception ex)
         {
-            #if ENABLE_LOGGING
-            try
-            {
-                string logPath = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "version_check.log");
-                string logMessage = $"[{DateTime.Now}] Version check error: {ex.Message}\r\n{ex.StackTrace}\r\n";
-                File.AppendAllText(logPath, logMessage);
-            }
-            catch
-            {
-                // Ignore logging errors
-            }
-            #endif
+            Logger.LogError("Version check error", ex);
         }
 
         private class VersionInfo

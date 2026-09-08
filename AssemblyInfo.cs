@@ -13,7 +13,7 @@ using System.Windows.Resources;
 [assembly: AssemblyConfiguration("")]
 [assembly: AssemblyCompany("MAX CRYSIS COMMUNITY")]
 [assembly: AssemblyProduct("Crysis 3 Multiplayer Launcher")]
-[assembly: AssemblyCopyright("Copyright ©  2025")]
+[assembly: AssemblyCopyright("Copyright ©  2026")]
 [assembly: AssemblyTrademark("")]
 [assembly: ComVisible(false)]
 
@@ -22,8 +22,8 @@ using System.Windows.Resources;
 [assembly: AssemblyFileVersion("0.9.0.0")]
 [assembly: AssemblyVersion("0.9.0.0")]
 #else
-[assembly: AssemblyFileVersion("1.0.0.1")]
-[assembly: AssemblyVersion("1.0.0.1")]
+[assembly: AssemblyFileVersion("1.0.1.0")]
+[assembly: AssemblyVersion("1.0.1.0")]
 #endif
 
 [assembly: AssemblyAssociatedContentFile("webview2loader.dll")]
