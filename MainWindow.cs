@@ -19,6 +19,7 @@ using System.Windows;
 using System.Windows.Markup;
 using System.Windows.Threading;
 using Microsoft.Web.WebView2.Wpf;
+using Microsoft.Web.WebView2.Core;
 using Newtonsoft.Json;
 using Newtonsoft.Json.Linq;
 using System.Security.Principal;
@@ -80,6 +81,7 @@ namespace Crysis3_MP_Launcher
             DataContext = this;
             _bin32Folder = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "bin32");
             _gameFolder = AppDomain.CurrentDomain.BaseDirectory;
+            HashCacheManager.Initialize(_gameFolder);
             _webView2LoaderPath = Path.Combine(_gameFolder, "WebView2Loader.dll");
             _isAdministrator = IsAdministrator();
             Logger.IsEnabled = true;
@@ -108,7 +110,9 @@ namespace Crysis3_MP_Launcher
             }
             #endif
             
-#if !UpdateChangelog
+#if UpdateChangelog
+            InitializeChangelog();
+#else
             ChangelogTab.Visibility = Visibility.Collapsed;
             ChangelogTab.IsEnabled = false;
 #endif
@@ -220,10 +224,9 @@ namespace Crysis3_MP_Launcher
                             {
                                 netSpeedLabel.Content = $"Speed: {report.SpeedBytesPerSecond / 1048576.0:F2} MB/s";
                             }
-
-                            if (!string.IsNullOrEmpty(report.StatusMessage))
+                            else if (report.DownloadedBytes > 0 && report.DownloadedBytes < report.TotalBytes)
                             {
-                                statusLabel.Content = report.StatusMessage;
+                                netSpeedLabel.Content = "Speed: 0.00 MB/s";
                             }
                         }
                         catch { /* Ignore UI update errors */ }
@@ -261,27 +264,41 @@ namespace Crysis3_MP_Launcher
 
                         var parallelOptions = new ParallelOptions
                         {
-                            MaxDegreeOfParallelism = Environment.ProcessorCount
+                            MaxDegreeOfParallelism = Math.Min(8, Math.Max(2, Environment.ProcessorCount))
                         };
 
                         await Task.Run(() =>
                         {
                             Parallel.ForEach(fileHashes, parallelOptions, fileHash =>
                             {
-                                string path = fileHash.Key.Replace($"{_serverBaseUrl}{SERVER_MOD_PATH}", "").Replace('/', '\\');
-                                string localPath = Path.Combine(_gameFolder, path);
+                                string localPath = GetLocalPathFromUrl(fileHash.Key);
 
                                 bool isValid = false;
                                 try
                                 {
-                                    if (File.Exists(localPath))
+                                    var fileInfo = new FileInfo(localPath);
+                                    if (fileInfo.Exists)
                                     {
-                                        string computedHash = ComputeMD5(localPath);
-                                        if (string.Equals(computedHash, fileHash.Value, StringComparison.OrdinalIgnoreCase))
+                                        long fileSize = fileInfo.Length;
+                                        long lastWriteTicks = fileInfo.LastWriteTimeUtc.Ticks;
+
+                                        if (HashCacheManager.TryGetHash(localPath, lastWriteTicks, fileSize, out string cachedHash))
                                         {
-                                            isValid = true;
-                                            long fileSize = new FileInfo(localPath).Length;
-                                            Interlocked.Add(ref existingFilesSize, fileSize);
+                                            if (string.Equals(cachedHash, fileHash.Value, StringComparison.OrdinalIgnoreCase))
+                                            {
+                                                isValid = true;
+                                                Interlocked.Add(ref existingFilesSize, fileSize);
+                                            }
+                                        }
+                                        else
+                                        {
+                                            string computedHash = ComputeMD5(localPath);
+                                            if (string.Equals(computedHash, fileHash.Value, StringComparison.OrdinalIgnoreCase))
+                                            {
+                                                isValid = true;
+                                                Interlocked.Add(ref existingFilesSize, fileSize);
+                                                HashCacheManager.SetHash(localPath, lastWriteTicks, fileSize, computedHash);
+                                            }
                                         }
                                     }
                                 }
@@ -316,6 +333,8 @@ namespace Crysis3_MP_Launcher
                                 }
                             });
                         });
+
+                        HashCacheManager.Save();
 
                         _totalDownloadSize = Math.Max(0, _totalDownloadSize - existingFilesSize);
 
@@ -357,37 +376,58 @@ namespace Crysis3_MP_Launcher
 
                         downloadManager.ResetCounters(_totalDownloadSize, totalFilesToDownload);
 
+                        await Dispatcher.InvokeAsync(() =>
+                        {
+                            progressBar.Value = 0;
+                            netSpeedLabel.Content = string.Empty;
+                            progressLabel.Content = string.Empty;
+                        });
+
                         int processorCount = Environment.ProcessorCount;
                         int concurrentDownloads = Math.Min(8, Math.Max(2, processorCount));
                         List<Task> downloadTasks = new List<Task>();
                         using (var semaphore = new SemaphoreSlim(concurrentDownloads))
                         {
+                            async Task DownloadItemAsync(string downloadUrl, string targetPath, string expectedHash)
+                            {
+                                try
+                                {
+                                    bool success = await downloadManager.DownloadFileWithRetryAsync(downloadUrl, targetPath, 5, progress).ConfigureAwait(false);
+                                    if (success)
+                                    {
+                                        try
+                                        {
+                                            var fi = new FileInfo(targetPath);
+                                            if (fi.Exists)
+                                            {
+                                                HashCacheManager.SetHash(targetPath, fi.LastWriteTimeUtc.Ticks, fi.Length, expectedHash);
+                                            }
+                                        }
+                                        catch { }
+                                    }
+                                    var remaining = Interlocked.Decrement(ref remainingFiles);
+                                    progress.Report($"Downloading files ( {totalFilesToDownload - remaining}/{totalFilesToDownload} )...");
+                                }
+                                finally
+                                {
+                                    semaphore.Release();
+                                }
+                            }
+
                             progress.Report($"Downloading files ( 0/{totalFilesToDownload} )...");
                             LogMessage($"Using {concurrentDownloads} concurrent downloads for {totalFilesToDownload} files...");
 
                             foreach (var file in filesToDownloadList)
                             {
                                 string url = file.Key;
-                                string path = url.Replace($"{_serverBaseUrl}{SERVER_MOD_PATH}", "").Replace('/', '\\');
-                                string filePath = Path.Combine(_gameFolder, path);
+                                string filePath = GetLocalPathFromUrl(url);
                                 
                                 await semaphore.WaitAsync();
-                                
-                                downloadTasks.Add(Task.Run(async () => {
-                                    try
-                                    {
-                                        await downloadManager.DownloadFileWithRetryAsync(url, filePath, 5, progress);
-                                        var remaining = Interlocked.Decrement(ref remainingFiles);
-                                        progress.Report($"Downloading files ( {totalFilesToDownload - remaining}/{totalFilesToDownload} )...");
-                                    }
-                                    finally
-                                    {
-                                        semaphore.Release();
-                                    }
-                                }));
+                                downloadTasks.Add(DownloadItemAsync(url, filePath, file.Value));
                             }
 
                             await Task.WhenAll(downloadTasks);
+                            HashCacheManager.Save();
                         }
 
                         _failedDownloads = new List<string>(downloadManager.FailedDownloads);
@@ -406,7 +446,19 @@ namespace Crysis3_MP_Launcher
                         #endif
                         });
                         
-                        progress.Report("Ready to play");
+                        if (_failedDownloads.Count > 0)
+                        {
+                            LogMessage($"[UPDATE] Completed with {_failedDownloads.Count} failed download(s):");
+                            foreach (var failed in _failedDownloads)
+                            {
+                                LogMessage($"  - {failed}");
+                            }
+                            progress.Report($"Update completed with {_failedDownloads.Count} error(s).");
+                        }
+                        else
+                        {
+                            progress.Report("Ready to play");
+                        }
 
                     #if UpdateChangelog
                     // WebView2 DLL kontrolü
@@ -436,13 +488,41 @@ namespace Crysis3_MP_Launcher
             return Dispatcher.InvokeAsync(() => statusLabel.Content = message).Task;
         }
 
-        private void HideDownloadLabels() => Dispatcher.Invoke(() =>
+        private void HideDownloadLabels()
         {
-            progressBar.Value = 0;
-            netSpeedLabel.Content = string.Empty;
-            progressLabel.Content = string.Empty;
-        });
-		
+            void Reset()
+            {
+                progressBar.Value = 0;
+                netSpeedLabel.Content = string.Empty;
+                progressLabel.Content = string.Empty;
+            }
+
+            if (Dispatcher.CheckAccess())
+            {
+                Reset();
+            }
+            else
+            {
+                Dispatcher.Invoke(Reset);
+            }
+        }
+
+        private string GetLocalPathFromUrl(string url)
+        {
+            string prefix = $"{_serverBaseUrl}{SERVER_MOD_PATH}";
+            string relativePath;
+            if (url.StartsWith(prefix, StringComparison.OrdinalIgnoreCase))
+            {
+                relativePath = url.Substring(prefix.Length);
+            }
+            else
+            {
+                int idx = url.IndexOf(SERVER_MOD_PATH, StringComparison.OrdinalIgnoreCase);
+                relativePath = idx >= 0 ? url.Substring(idx + SERVER_MOD_PATH.Length) : Path.GetFileName(url);
+            }
+            relativePath = relativePath.TrimStart('/', '\\').Replace('/', Path.DirectorySeparatorChar);
+            return Path.Combine(_gameFolder, relativePath);
+        }
 
         private string NormalizePath(string path)
         {
@@ -457,9 +537,7 @@ namespace Crysis3_MP_Launcher
             if (!Directory.Exists(modFolder)) return;
 
             var validFiles = new HashSet<string>(
-                fileHashes.Select(fh =>
-                    NormalizePath(Path.Combine(_gameFolder, fh.Key.Replace($"{_serverBaseUrl}{SERVER_MOD_PATH}", "").Replace('/', Path.DirectorySeparatorChar)))
-                ),
+                fileHashes.Select(fh => NormalizePath(GetLocalPathFromUrl(fh.Key))),
                 StringComparer.OrdinalIgnoreCase
             );
 
@@ -470,7 +548,12 @@ namespace Crysis3_MP_Launcher
                 {
                     if (!validFiles.Contains(NormalizePath(filePath)))
                     {
-                        try { File.Delete(filePath); } catch { }
+                        try
+                        {
+                            File.Delete(filePath);
+                            HashCacheManager.Remove(filePath);
+                        }
+                        catch { }
                     }
                 }
 
@@ -478,13 +561,13 @@ namespace Crysis3_MP_Launcher
                     .OrderByDescending(x => x.Length);
                 foreach (var dirPath in allDirs)
                 {
-                    string relativePath = dirPath.Replace(modFolder, "")
-                        .TrimStart(Path.DirectorySeparatorChar)
-                        .Replace('\\', '/');
+                    string relativePath = dirPath.StartsWith(modFolder, StringComparison.OrdinalIgnoreCase)
+                        ? dirPath.Substring(modFolder.Length).TrimStart(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar).Replace('\\', '/')
+                        : Path.GetFileName(dirPath);
 
-                    string url = Uri.UnescapeDataString($"{_serverBaseUrl}{SERVER_MOD_PATH}Mods/{GAME_MOD_FOLDER}/{Uri.EscapeDataString(relativePath)}");
+                    string url = $"{_serverBaseUrl}{SERVER_MOD_PATH}Mods/{GAME_MOD_FOLDER}/{relativePath}/";
 
-                    bool hasMatchingFiles = fileHashes.Keys.Any(key => key.StartsWith(url, StringComparison.OrdinalIgnoreCase));
+                    bool hasMatchingFiles = fileHashes.Keys.Any(key => (key + "/").StartsWith(url, StringComparison.OrdinalIgnoreCase) || key.StartsWith(url, StringComparison.OrdinalIgnoreCase));
                     if (!hasMatchingFiles)
                     {
                         try
@@ -504,6 +587,8 @@ namespace Crysis3_MP_Launcher
                     }
                 }
             });
+
+            HashCacheManager.Save();
         }
 
 
@@ -527,13 +612,29 @@ namespace Crysis3_MP_Launcher
             return new Dictionary<string, string>();
         }
 
+        private static readonly ThreadLocal<MD5> _md5Provider = new ThreadLocal<MD5>(() => MD5.Create());
+        private static readonly char[] _hexLookup = "0123456789abcdef".ToCharArray();
+
+        private static string FastHex(byte[] bytes)
+        {
+            char[] c = new char[bytes.Length * 2];
+            for (int i = 0; i < bytes.Length; i++)
+            {
+                int b = bytes[i];
+                c[i * 2] = _hexLookup[b >> 4];
+                c[i * 2 + 1] = _hexLookup[b & 0x0F];
+            }
+            return new string(c);
+        }
+
         private string ComputeMD5(string filePath)
         {
             try
             {
-                using var md5 = MD5.Create();
-                using var stream = new FileStream(filePath, FileMode.Open, FileAccess.Read, FileShare.Read, 65536, FileOptions.SequentialScan);
-                return BitConverter.ToString(md5.ComputeHash(stream)).Replace("-", "").ToLowerInvariant();
+                var md5 = _md5Provider.Value;
+                using var stream = new FileStream(filePath, FileMode.Open, FileAccess.Read, FileShare.Read, 262144, FileOptions.SequentialScan);
+                byte[] hashBytes = md5.ComputeHash(stream);
+                return FastHex(hashBytes);
             }
             catch (Exception ex)
             {
@@ -551,7 +652,11 @@ namespace Crysis3_MP_Launcher
             {
                 try
                 {
-                    Process.Start(execPath);
+                    var psi = new ProcessStartInfo(execPath)
+                    {
+                        WorkingDirectory = _bin32Folder
+                    };
+                    Process.Start(psi);
                     Application.Current.Shutdown();
                 }
                 catch (Exception ex)
@@ -625,6 +730,25 @@ namespace Crysis3_MP_Launcher
                 catch {  }
             });
         }
+
+#if UpdateChangelog
+        private async void InitializeChangelog()
+        {
+            try
+            {
+                string userDataFolder = Path.Combine(Path.GetTempPath(), "Crysis3_Launcher_WebView2");
+                var env = await CoreWebView2Environment.CreateAsync(null, userDataFolder);
+                var webView = new WebView2();
+                ChangelogContainer.Child = webView;
+                await webView.EnsureCoreWebView2Async(env);
+                webView.Source = new Uri("http://lb.crysis2.epicgamer.org/openspymod/changelog/");
+            }
+            catch (Exception ex)
+            {
+                LogMessage($"[WARNING] Failed to initialize WebView2 changelog: {ex.Message}");
+            }
+        }
+#endif
     }
 
 

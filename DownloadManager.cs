@@ -51,11 +51,11 @@ namespace Crysis3_MP_Launcher
 
         public int TotalFiles
         {
-            get => _totalFiles;
-            set => _totalFiles = value;
+            get => Volatile.Read(ref _totalFiles);
+            set => Volatile.Write(ref _totalFiles, value);
         }
 
-        public int DownloadedFiles => _downloadedFiles;
+        public int DownloadedFiles => Volatile.Read(ref _downloadedFiles);
 
         public IReadOnlyList<string> FailedDownloads
         {
@@ -99,11 +99,14 @@ namespace Crysis3_MP_Launcher
             {
                 Timeout = Timeout.InfiniteTimeSpan
             };
-            _httpClient.DefaultRequestHeaders.Add("Keep-Alive", "true");
+            _httpClient.DefaultRequestHeaders.ConnectionClose = false;
         }
+
+        private bool _totalBytesExplicitlySet;
 
         public void ResetCounters(long totalBytes = 0, int totalFiles = 0)
         {
+            _totalBytesExplicitlySet = totalBytes > 0 && totalFiles > 1;
             Interlocked.Exchange(ref _totalBytes, totalBytes);
             Interlocked.Exchange(ref _downloadedBytes, 0);
             _downloadedFiles = 0;
@@ -118,6 +121,18 @@ namespace Crysis3_MP_Launcher
             lock (_failedDownloads)
             {
                 _failedDownloads.Clear();
+            }
+        }
+
+        private void UpdateTotalBytes(long contentLength)
+        {
+            if (Volatile.Read(ref _totalFiles) <= 1)
+            {
+                Interlocked.Exchange(ref _totalBytes, contentLength);
+            }
+            else if (!_totalBytesExplicitlySet)
+            {
+                Interlocked.Add(ref _totalBytes, contentLength);
             }
         }
 
@@ -140,13 +155,33 @@ namespace Crysis3_MP_Launcher
             return await response.Content.ReadAsStringAsync().ConfigureAwait(false);
         }
 
-        public async Task<byte[]> DownloadByteArrayAsync(string url, CancellationToken cancellationToken = default)
+        public async Task<byte[]> DownloadByteArrayAsync(string url, TimeSpan? timeout = null, CancellationToken cancellationToken = default)
         {
             ThrowIfDisposed();
 
-            using var response = await _httpClient.GetAsync(url, cancellationToken).ConfigureAwait(false);
+            using var cts = timeout.HasValue
+                ? CancellationTokenSource.CreateLinkedTokenSource(cancellationToken)
+                : null;
+
+            if (cts != null && timeout.HasValue)
+            {
+                cts.CancelAfter(timeout.Value);
+            }
+
+            var token = cts?.Token ?? cancellationToken;
+            using var response = await _httpClient.GetAsync(url, token).ConfigureAwait(false);
             response.EnsureSuccessStatusCode();
             return await response.Content.ReadAsByteArrayAsync().ConfigureAwait(false);
+        }
+
+        public const long SegmentedDownloadThreshold = 20 * 1024 * 1024L; // 20 MB
+
+        private static int CalculatePartCount(long totalSize)
+        {
+            if (totalSize < SegmentedDownloadThreshold) return 1;
+            if (totalSize < 60 * 1024 * 1024L) return 4;
+            if (totalSize < 150 * 1024 * 1024L) return Math.Min(6, Math.Max(4, Environment.ProcessorCount));
+            return Math.Min(8, Math.Max(4, Environment.ProcessorCount));
         }
 
         public async Task DownloadFileAsync(string url, string filePath, CancellationToken cancellationToken = default)
@@ -156,25 +191,366 @@ namespace Crysis3_MP_Launcher
             using var response = await _httpClient.GetAsync(Uri.EscapeUriString(url), HttpCompletionOption.ResponseHeadersRead, cancellationToken).ConfigureAwait(false);
             response.EnsureSuccessStatusCode();
 
+            long? contentLength = response.Content.Headers.ContentLength;
+            bool supportsRanges = response.Headers.AcceptRanges != null &&
+                (response.Headers.AcceptRanges.Contains("bytes") || response.Content.Headers.Contains("Content-Range"));
+
+            if (contentLength.HasValue)
+            {
+                UpdateTotalBytes(contentLength.Value);
+            }
+
+            if (contentLength.HasValue && contentLength.Value >= SegmentedDownloadThreshold && supportsRanges)
+            {
+                response.Dispose();
+                try
+                {
+                    await DownloadSegmentedAsync(url, filePath, contentLength.Value, cancellationToken).ConfigureAwait(false);
+                    return;
+                }
+                catch (OperationCanceledException)
+                {
+                    throw;
+                }
+                catch (Exception ex)
+                {
+                    _logger?.Invoke($"[DOWNLOAD] Multi-part download failed for {Path.GetFileName(filePath)} ({ex.Message}). Retrying with single stream...");
+                    await DownloadSingleStreamAsync(url, filePath, cancellationToken).ConfigureAwait(false);
+                    return;
+                }
+            }
+
+            await StreamResponseToFileAsync(response, filePath, cancellationToken).ConfigureAwait(false);
+        }
+
+        private async Task DownloadSingleStreamAsync(string url, string filePath, CancellationToken cancellationToken)
+        {
+            using var response = await _httpClient.GetAsync(Uri.EscapeUriString(url), HttpCompletionOption.ResponseHeadersRead, cancellationToken).ConfigureAwait(false);
+            response.EnsureSuccessStatusCode();
+
+            long? contentLength = response.Content.Headers.ContentLength;
+            if (contentLength.HasValue)
+            {
+                UpdateTotalBytes(contentLength.Value);
+            }
+
+            await StreamResponseToFileAsync(response, filePath, cancellationToken).ConfigureAwait(false);
+        }
+
+        private async Task StreamResponseToFileAsync(HttpResponseMessage response, string filePath, CancellationToken cancellationToken)
+        {
             string directory = Path.GetDirectoryName(filePath);
-            if (!string.IsNullOrEmpty(directory) && !Directory.Exists(directory))
+            if (!string.IsNullOrEmpty(directory))
             {
                 Directory.CreateDirectory(directory);
             }
 
-            using var stream = await response.Content.ReadAsStreamAsync().ConfigureAwait(false);
-            using var fileStream = new FileStream(filePath, FileMode.Create, FileAccess.Write, FileShare.None, 131072, true);
-            var buffer = new byte[131072]; // 128KB buffer
+            string tempFilePath = filePath + ".tmp";
+            const int bufferSize = 81920; // 80KB buffer (stays below 85,000 bytes LOH limit)
 
-            while (true)
+            long bytesThisAttempt = 0;
+            try
             {
-                int bytesRead = await stream.ReadAsync(buffer, 0, buffer.Length, cancellationToken).ConfigureAwait(false);
-                if (bytesRead == 0) break;
+                using (var stream = await response.Content.ReadAsStreamAsync().ConfigureAwait(false))
+                using (var fileStream = new FileStream(tempFilePath, FileMode.Create, FileAccess.Write, FileShare.None, bufferSize, true))
+                {
+                    var buffer = new byte[bufferSize];
+                    while (true)
+                    {
+                        int bytesRead = await stream.ReadAsync(buffer, 0, buffer.Length, cancellationToken).ConfigureAwait(false);
+                        if (bytesRead == 0) break;
 
-                await fileStream.WriteAsync(buffer, 0, bytesRead, cancellationToken).ConfigureAwait(false);
-                Interlocked.Add(ref _downloadedBytes, bytesRead);
-                ReportProgress();
+                        await fileStream.WriteAsync(buffer, 0, bytesRead, cancellationToken).ConfigureAwait(false);
+                        bytesThisAttempt += bytesRead;
+                        Interlocked.Add(ref _downloadedBytes, bytesRead);
+                        ReportProgress();
+                    }
+                }
+
+                await SafeReplaceFileAsync(tempFilePath, filePath).ConfigureAwait(false);
             }
+            catch
+            {
+                if (bytesThisAttempt > 0)
+                {
+                    Interlocked.Add(ref _downloadedBytes, -bytesThisAttempt);
+                    ReportProgress();
+                }
+
+                try
+                {
+                    if (File.Exists(tempFilePath))
+                    {
+                        File.Delete(tempFilePath);
+                    }
+                }
+                catch { }
+
+                throw;
+            }
+        }
+
+        private async Task DownloadSegmentedAsync(string url, string filePath, long totalSize, CancellationToken cancellationToken)
+        {
+            UpdateTotalBytes(totalSize);
+
+            string directory = Path.GetDirectoryName(filePath);
+            if (!string.IsNullOrEmpty(directory))
+            {
+                Directory.CreateDirectory(directory);
+            }
+
+            string tempFilePath = filePath + ".tmp";
+            int partCount = CalculatePartCount(totalSize);
+
+            long partSize = totalSize / partCount;
+            var partFiles = new string[partCount];
+            var tasks = new Task[partCount];
+
+            long totalBytesAddedAcrossSegments = 0;
+
+            for (int i = 0; i < partCount; i++)
+            {
+                partFiles[i] = $"{tempFilePath}.part{i}";
+            }
+
+            // Ensure any stale part or temp files from prior aborted attempts are cleaned up
+            DeletePartFiles(partFiles);
+            try { if (File.Exists(tempFilePath)) File.Delete(tempFilePath); } catch { }
+
+            string fileName = Path.GetFileName(filePath);
+            _logger?.Invoke($"[DOWNLOAD] Multi-part download started for {fileName} ({partCount} parts, {totalSize:N0} bytes)");
+            ReportProgress(force: true);
+
+            try
+            {
+                for (int i = 0; i < partCount; i++)
+                {
+                    long start = partSize * i;
+                    long end = (i == partCount - 1) ? totalSize - 1 : start + partSize - 1;
+                    string partPath = partFiles[i];
+
+                    tasks[i] = DownloadSegmentWithRetryAsync(
+                        url,
+                        partPath,
+                        start,
+                        end,
+                        bytesRead =>
+                        {
+                            Interlocked.Add(ref _downloadedBytes, bytesRead);
+                            Interlocked.Add(ref totalBytesAddedAcrossSegments, bytesRead);
+                            ReportProgress();
+                        },
+                        bytesToRollback =>
+                        {
+                            Interlocked.Add(ref _downloadedBytes, -bytesToRollback);
+                            Interlocked.Add(ref totalBytesAddedAcrossSegments, -bytesToRollback);
+                            ReportProgress();
+                        },
+                        cancellationToken);
+                }
+
+                await Task.WhenAll(tasks).ConfigureAwait(false);
+
+                // Combine downloaded parts into tempFilePath
+                await CombinePartsAsync(partFiles, tempFilePath, cancellationToken).ConfigureAwait(false);
+
+                // Verify assembled file size
+                var tempFi = new FileInfo(tempFilePath);
+                if (tempFi.Length != totalSize)
+                {
+                    throw new IOException($"Combined file size mismatch for {Path.GetFileName(filePath)}. Expected {totalSize} bytes, got {tempFi.Length} bytes.");
+                }
+
+                DeletePartFiles(partFiles);
+                await SafeReplaceFileAsync(tempFilePath, filePath).ConfigureAwait(false);
+                _logger?.Invoke($"[DOWNLOAD] Successfully downloaded and assembled {Path.GetFileName(filePath)}");
+            }
+            catch
+            {
+                long rollback = Interlocked.Read(ref totalBytesAddedAcrossSegments);
+                if (rollback > 0)
+                {
+                    Interlocked.Add(ref _downloadedBytes, -rollback);
+                    ReportProgress();
+                }
+
+                DeletePartFiles(partFiles);
+                try
+                {
+                    if (File.Exists(tempFilePath))
+                    {
+                        File.Delete(tempFilePath);
+                    }
+                }
+                catch { }
+
+                throw;
+            }
+        }
+
+        private async Task DownloadSegmentWithRetryAsync(
+            string url,
+            string partPath,
+            long start,
+            long end,
+            Action<long> onBytesRead,
+            Action<long> onRollback,
+            CancellationToken cancellationToken)
+        {
+            const int maxSegmentRetries = 3;
+            const int bufferSize = 81920; // 80KB buffer (stays below 85,000 bytes LOH limit)
+
+            for (int attempt = 1; attempt <= maxSegmentRetries; attempt++)
+            {
+                long bytesThisAttempt = 0;
+                try
+                {
+                    using var request = new HttpRequestMessage(HttpMethod.Get, Uri.EscapeUriString(url));
+                    request.Headers.Range = new RangeHeaderValue(start, end);
+
+                    using var response = await _httpClient.SendAsync(request, HttpCompletionOption.ResponseHeadersRead, cancellationToken).ConfigureAwait(false);
+                    response.EnsureSuccessStatusCode();
+
+                    if (response.StatusCode != HttpStatusCode.PartialContent)
+                    {
+                        throw new HttpRequestException($"Server does not support partial content. Expected 206 Partial Content, received {response.StatusCode}.");
+                    }
+
+                    using (var stream = await response.Content.ReadAsStreamAsync().ConfigureAwait(false))
+                    using (var fileStream = new FileStream(partPath, FileMode.Create, FileAccess.Write, FileShare.None, bufferSize, true))
+                    {
+                        var buffer = new byte[bufferSize];
+                        while (true)
+                        {
+                            int bytesRead = await stream.ReadAsync(buffer, 0, buffer.Length, cancellationToken).ConfigureAwait(false);
+                            if (bytesRead == 0) break;
+
+                            await fileStream.WriteAsync(buffer, 0, bytesRead, cancellationToken).ConfigureAwait(false);
+                            bytesThisAttempt += bytesRead;
+                            onBytesRead(bytesRead);
+                        }
+                    }
+
+                    long expectedSize = end - start + 1;
+                    var fi = new FileInfo(partPath);
+                    if (fi.Length != expectedSize)
+                    {
+                        throw new IOException($"Downloaded segment size mismatch. Expected {expectedSize} bytes, got {fi.Length} bytes.");
+                    }
+
+                    return;
+                }
+                catch (OperationCanceledException)
+                {
+                    if (bytesThisAttempt > 0)
+                    {
+                        onRollback(bytesThisAttempt);
+                    }
+                    try { if (File.Exists(partPath)) File.Delete(partPath); } catch { }
+                    throw;
+                }
+                catch (Exception ex)
+                {
+                    if (bytesThisAttempt > 0)
+                    {
+                        onRollback(bytesThisAttempt);
+                    }
+                    try { if (File.Exists(partPath)) File.Delete(partPath); } catch { }
+
+                    if (attempt == maxSegmentRetries)
+                    {
+                        _logger?.Invoke($"[DOWNLOAD] Segment {start}-{end} failed after {maxSegmentRetries} attempts: {ex.Message}");
+                        throw;
+                    }
+
+                    _logger?.Invoke($"[DOWNLOAD] Segment {start}-{end} attempt {attempt} failed ({ex.Message}), retrying in {attempt}s...");
+                    await Task.Delay(1000 * attempt, cancellationToken).ConfigureAwait(false);
+                }
+            }
+        }
+
+        private static async Task SafeReplaceFileAsync(string sourceFile, string targetFile)
+        {
+            for (int i = 0; i < 5; i++)
+            {
+                try
+                {
+                    if (File.Exists(targetFile))
+                    {
+                        var attr = File.GetAttributes(targetFile);
+                        if ((attr & FileAttributes.ReadOnly) != 0)
+                        {
+                            File.SetAttributes(targetFile, attr & ~FileAttributes.ReadOnly);
+                        }
+                        File.Delete(targetFile);
+                    }
+                    File.Move(sourceFile, targetFile);
+                    return;
+                }
+                catch (Exception ex) when ((ex is IOException || ex is UnauthorizedAccessException) && i < 4)
+                {
+                    await Task.Delay(250).ConfigureAwait(false);
+                }
+            }
+        }
+
+        private static void DeletePartFiles(IEnumerable<string> partFiles)
+        {
+            if (partFiles == null) return;
+            foreach (var partFile in partFiles)
+            {
+                try
+                {
+                    if (File.Exists(partFile))
+                    {
+                        var attr = File.GetAttributes(partFile);
+                        if ((attr & FileAttributes.ReadOnly) != 0)
+                        {
+                            File.SetAttributes(partFile, attr & ~FileAttributes.ReadOnly);
+                        }
+                        File.Delete(partFile);
+                    }
+                }
+                catch { }
+            }
+        }
+
+        private static void CleanupTempAndPartFiles(string filePath)
+        {
+            try
+            {
+                string tempFilePath = filePath + ".tmp";
+                if (File.Exists(tempFilePath))
+                {
+                    var attr = File.GetAttributes(tempFilePath);
+                    if ((attr & FileAttributes.ReadOnly) != 0)
+                    {
+                        File.SetAttributes(tempFilePath, attr & ~FileAttributes.ReadOnly);
+                    }
+                    File.Delete(tempFilePath);
+                }
+
+                string dir = Path.GetDirectoryName(filePath);
+                if (!string.IsNullOrEmpty(dir) && Directory.Exists(dir))
+                {
+                    string searchPattern = Path.GetFileName(filePath) + ".tmp.part*";
+                    foreach (var part in Directory.GetFiles(dir, searchPattern))
+                    {
+                        try
+                        {
+                            var attr = File.GetAttributes(part);
+                            if ((attr & FileAttributes.ReadOnly) != 0)
+                            {
+                                File.SetAttributes(part, attr & ~FileAttributes.ReadOnly);
+                            }
+                            File.Delete(part);
+                        }
+                        catch { }
+                    }
+                }
+            }
+            catch { }
         }
 
         public async Task<bool> DownloadFileWithRetryAsync(string url, string filePath, int retryCount = 5, IProgress<string> statusProgress = null, CancellationToken cancellationToken = default)
@@ -197,6 +573,7 @@ namespace Crysis3_MP_Launcher
                     _logger?.Invoke($"[DOWNLOAD] Retry {attempt}/{retryCount} for {Path.GetFileName(filePath)} failed: {ex.Message}");
                     if (attempt == retryCount)
                     {
+                        CleanupTempAndPartFiles(filePath);
                         try { if (File.Exists(filePath)) File.Delete(filePath); } catch { }
                         lock (_failedDownloads)
                         {
@@ -212,6 +589,7 @@ namespace Crysis3_MP_Launcher
                     _logger?.Invoke($"[DOWNLOAD] Error downloading {Path.GetFileName(filePath)}: {ex.Message}");
                     if (attempt == retryCount)
                     {
+                        CleanupTempAndPartFiles(filePath);
                         try { if (File.Exists(filePath)) File.Delete(filePath); } catch { }
                         lock (_failedDownloads)
                         {
@@ -286,7 +664,7 @@ namespace Crysis3_MP_Launcher
             using var request = new HttpRequestMessage(HttpMethod.Get, url);
             request.Headers.Range = new RangeHeaderValue(start, end);
 
-            const int bufferSize = 262144; // 256KB buffer
+            const int bufferSize = 81920; // 80KB buffer (stays below 85,000 bytes LOH limit)
 
             using var response = await _httpClient.SendAsync(request, HttpCompletionOption.ResponseHeadersRead, cancellationToken).ConfigureAwait(false);
             response.EnsureSuccessStatusCode();
@@ -308,13 +686,14 @@ namespace Crysis3_MP_Launcher
             }
         }
 
-        private async Task CombinePartsAsync(string[] partFiles, string outputPath)
+        private static async Task CombinePartsAsync(string[] partFiles, string outputPath, CancellationToken cancellationToken = default)
         {
-            using var outputStream = new FileStream(outputPath, FileMode.Create);
+            const int bufferSize = 81920; // 80KB buffer
+            using var outputStream = new FileStream(outputPath, FileMode.Create, FileAccess.Write, FileShare.None, bufferSize, true);
             foreach (var partFile in partFiles)
             {
-                using var inputStream = new FileStream(partFile, FileMode.Open);
-                await inputStream.CopyToAsync(outputStream).ConfigureAwait(false);
+                using var inputStream = new FileStream(partFile, FileMode.Open, FileAccess.Read, FileShare.Read, bufferSize, true);
+                await inputStream.CopyToAsync(outputStream, bufferSize, cancellationToken).ConfigureAwait(false);
             }
         }
 
@@ -356,7 +735,7 @@ namespace Crysis3_MP_Launcher
                                     }
                                     catch (IOException) when (retries < 2)
                                     {
-                                        Task.Delay(1000).Wait();
+                                        Thread.Sleep(1000);
                                     }
                                 }
                             }
@@ -445,7 +824,15 @@ namespace Crysis3_MP_Launcher
                     _lastSpeedCheckTime = now;
                 }
 
-                double percentage = currentTotal > 0 ? (currentDownloaded * 100.0) / currentTotal : 0;
+                double percentage = 0;
+                if (currentTotal > 0)
+                {
+                    percentage = (currentDownloaded * 100.0) / currentTotal;
+                }
+                else if (currentTotalFiles > 0)
+                {
+                    percentage = (currentFileIndex * 100.0) / currentTotalFiles;
+                }
                 if (percentage > 100.0) percentage = 100.0;
 
                 try
